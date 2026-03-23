@@ -258,6 +258,7 @@ def print_metrics_table(
         "Training/Actor": {},
         "Training/Critic": {},
         "Training/Other": {},
+        "Transfer Utility": {},
     }
 
     for key, value in metrics.items():
@@ -269,6 +270,7 @@ def print_metrics_table(
                 "rollout": "Rollout",
                 "eval": "Evaluation",
                 "replay_buffer": "Replay Buffer",
+                "transfer_risk": "Transfer Utility",
             }
             if category in category_map:
                 categories[category_map[category]][metric_name] = value

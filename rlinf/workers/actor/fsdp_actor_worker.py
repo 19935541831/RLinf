@@ -31,6 +31,7 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
+from rlinf.data.datasets.holdout_dataset import HoldoutSuccessDataset
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
@@ -1014,6 +1015,44 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        transfer_cfg = cfg.get("transfer_utility", None)
+        self.transfer_utility_enabled = bool(
+            transfer_cfg is not None and transfer_cfg.get("enabled", False)
+        )
+        self.holdout_eval_interval = (
+            int(transfer_cfg.get("holdout_eval_interval", 5))
+            if self.transfer_utility_enabled
+            else 5
+        )
+        self.holdout_batch_size = (
+            int(transfer_cfg.get("holdout_batch_size", 8))
+            if self.transfer_utility_enabled
+            else 8
+        )
+        self.holdout_data_path = (
+            transfer_cfg.get("holdout_data_path", None)
+            if self.transfer_utility_enabled
+            else None
+        )
+        self.behavior_drift_rho_t = (
+            float(transfer_cfg.get("rho_t", 0.0))
+            if self.transfer_utility_enabled
+            else 0.0
+        )
+        self.behavior_drift_data_path = (
+            transfer_cfg.get("behavior_drift_data_path", None)
+            if self.transfer_utility_enabled
+            else None
+        )
+        self.behavior_drift_batch_size = (
+            int(transfer_cfg.get("behavior_drift_batch_size", 64))
+            if self.transfer_utility_enabled
+            else 64
+        )
+        self._ref_policy_state_dict = None
+        self._ref_offload_buffer = {}
+        self._holdout_dataset = None
+        self._behavior_drift_dataset = None
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1041,11 +1080,313 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
+        if self.transfer_utility_enabled:
+            self._ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            self._ref_offload_buffer = {}
 
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
+        if self.holdout_data_path:
+            self._holdout_dataset = HoldoutSuccessDataset(
+                data_dir=self.holdout_data_path,
+            )
+            self.log_info(
+                f"Loaded holdout success dataset from {self.holdout_data_path}, "
+                f"num_episodes={len(self._holdout_dataset)}"
+            )
+        if self.behavior_drift_data_path:
+            self._behavior_drift_dataset = HoldoutSuccessDataset(
+                data_dir=self.behavior_drift_data_path,
+            )
+            self.log_info(
+                "Loaded behavior-drift success dataset from "
+                f"{self.behavior_drift_data_path}, "
+                f"num_episodes={len(self._behavior_drift_dataset)}"
+            )
+
+    def _build_holdout_env_obs(
+        self, holdout_items: list[dict[str, torch.Tensor]]
+    ) -> dict[str, torch.Tensor | list[str]]:
+        main_images = []
+        wrist_images = []
+        has_wrist = False
+        states = []
+        task_descriptions = []
+        for item in holdout_items:
+            observation = item["observation"]
+            image = observation.get("image", None)
+            if image is None:
+                for key, value in observation.items():
+                    if isinstance(value, torch.Tensor) and value.ndim == 3:
+                        image = value
+                        break
+            if image is None:
+                raise ValueError("No image tensor found in holdout observation.")
+            if image.shape[0] == 3:  # CHW -> HWC
+                image = image.permute(1, 2, 0)
+            image = (image.float() * 255.0).clamp(0, 255).to(torch.uint8).cpu()
+            main_images.append(image)
+
+            wrist = observation.get("wrist_image", None)
+            if wrist is not None:
+                has_wrist = True
+                if wrist.shape[0] == 3:
+                    wrist = wrist.permute(1, 2, 0)
+                wrist = (wrist.float() * 255.0).clamp(0, 255).to(torch.uint8).cpu()
+                wrist_images.append(wrist)
+
+            state = observation.get("observation.state", None)
+            if state is None:
+                state = torch.zeros(8, dtype=torch.float32)
+            states.append(state.float().cpu())
+
+            task_descriptions.append(str(item.get("task", "")))
+
+        return {
+            "main_images": torch.stack(main_images, dim=0),  # [B, H, W, C]
+            "wrist_images": torch.stack(wrist_images, dim=0) if has_wrist else None,
+            "states": torch.stack(states, dim=0),
+            "task_descriptions": task_descriptions,
+        }
+
+    @staticmethod
+    def _expand_mask_like(
+        base_mask: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        expanded = base_mask
+        while len(expanded.shape) < len(target.shape):
+            expanded = expanded.unsqueeze(-1)
+        return expanded.expand_as(target).to(dtype=torch.bool)
+
+    @torch.no_grad()
+    def _compute_behavior_drift_kl(self, batch_size_per_rank: int) -> Optional[float]:
+        if (
+            not self.transfer_utility_enabled
+            or self._ref_policy_state_dict is None
+            or "prev_logprobs" not in self.rollout_batch
+        ):
+            return None
+
+        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        if rollout_size % batch_size_per_rank != 0:
+            return None
+
+        rollout_kl = self._compute_behavior_drift_kl_from_rollout(batch_size_per_rank)
+        if rollout_kl is None:
+            return None
+
+        rho_t = float(min(max(self.behavior_drift_rho_t, 0.0), 1.0))
+        if rho_t <= 0.0:
+            return rollout_kl
+
+        success_kl = self._compute_behavior_drift_kl_from_success_dataset()
+        if success_kl is None:
+            return rollout_kl
+        return (1.0 - rho_t) * rollout_kl + rho_t * success_kl
+
+    @torch.no_grad()
+    def _compute_behavior_drift_kl_from_rollout(
+        self, batch_size_per_rank: int
+    ) -> Optional[float]:
+        if (
+            self._ref_policy_state_dict is None
+            or "prev_logprobs" not in self.rollout_batch
+        ):
+            return None
+
+        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        if rollout_size % batch_size_per_rank != 0:
+            return None
+
+        model_was_training = self.model.training
+        self.model.eval()
+        total_kl_sum = 0.0
+        total_kl_count = 0
+        num_global_batches = rollout_size // batch_size_per_rank
+        rollout_dataloader_iter = split_dict_to_chunk(self.rollout_batch, num_global_batches)
+
+        try:
+            with cpu_weight_swap(
+                self.model, self._ref_policy_state_dict, self._ref_offload_buffer
+            ):
+                for train_global_batch in rollout_dataloader_iter:
+                    train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+                    num_micro_batches = max(
+                        train_global_batch_size // self.cfg.actor.micro_batch_size, 1
+                    )
+                    train_micro_batch = split_dict_to_chunk(
+                        train_global_batch, num_micro_batches
+                    )
+                    for batch in train_micro_batch:
+                        batch = put_tensor_device(
+                            batch,
+                            f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                        )
+                        prev_logprobs = batch["prev_logprobs"]
+                        forward_inputs = batch.get("forward_inputs", None)
+                        loss_mask = batch.get("loss_mask", None)
+
+                        model_kwargs = {}
+                        if SupportedModel(self.cfg.actor.model.model_type) in [
+                            SupportedModel.OPENVLA,
+                            SupportedModel.OPENVLA_OFT,
+                        ]:
+                            model_kwargs["temperature"] = (
+                                self.cfg.algorithm.sampling_params.temperature_train
+                            )
+                            model_kwargs["top_k"] = (
+                                self.cfg.algorithm.sampling_params.top_k
+                            )
+                        elif (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            model_kwargs["prev_logprobs"] = prev_logprobs
+
+                        with self.amp_context:
+                            output_dict = self.model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                compute_entropy=False,
+                                compute_values=False,
+                                use_cache=False,
+                                **model_kwargs,
+                            )
+
+                        if (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            prev_logprobs = output_dict["prev_logprobs"]
+                        ref_logprobs = output_dict["logprobs"]
+                        kl_delta = (prev_logprobs - ref_logprobs).float()
+                        if loss_mask is not None:
+                            valid_mask = self._expand_mask_like(loss_mask, kl_delta)
+                            if valid_mask.any():
+                                total_kl_sum += float(kl_delta[valid_mask].sum().item())
+                                total_kl_count += int(valid_mask.sum().item())
+                        else:
+                            total_kl_sum += float(kl_delta.sum().item())
+                            total_kl_count += int(kl_delta.numel())
+        finally:
+            if model_was_training:
+                self.model.train()
+
+        if total_kl_count == 0:
+            return 0.0
+        return total_kl_sum / float(total_kl_count)
+
+    @torch.no_grad()
+    def _compute_behavior_drift_kl_from_success_dataset(self) -> Optional[float]:
+        if (
+            self._behavior_drift_dataset is None
+            or len(self._behavior_drift_dataset) == 0
+            or self._ref_policy_state_dict is None
+        ):
+            return None
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if not hasattr(model, "predict_action_batch"):
+            return None
+
+        sampled = self._behavior_drift_dataset.sample_batch(self.behavior_drift_batch_size)
+        items = sampled["items"]
+        env_obs = self._build_holdout_env_obs(items)
+
+        model_was_training = self.model.training
+        self.model.eval()
+        try:
+            _, policy_result = model.predict_action_batch(
+                env_obs=env_obs,
+                do_sample=False,
+                temperature=1.0,
+                top_k=-1,
+                top_p=1.0,
+                max_new_tokens=None,
+            )
+            policy_logprobs = policy_result["prev_logprobs"]
+            forward_inputs = policy_result["forward_inputs"]
+
+            model_kwargs = {}
+            if SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.OPENVLA,
+                SupportedModel.OPENVLA_OFT,
+            ]:
+                model_kwargs["temperature"] = self.cfg.algorithm.sampling_params.temperature_train
+                model_kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+            elif SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.GR00T:
+                model_kwargs["prev_logprobs"] = policy_logprobs
+
+            with cpu_weight_swap(
+                self.model, self._ref_policy_state_dict, self._ref_offload_buffer
+            ):
+                with self.amp_context:
+                    ref_output = self.model(
+                        forward_inputs=forward_inputs,
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                        **model_kwargs,
+                    )
+
+            ref_logprobs = ref_output["logprobs"]
+            if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.GR00T:
+                policy_logprobs = ref_output["prev_logprobs"]
+
+            kl_delta = (policy_logprobs - ref_logprobs).float()
+            return float(kl_delta.mean().item())
+        finally:
+            if model_was_training:
+                self.model.train()
+
+    @torch.no_grad()
+    def _compute_holdout_action_support_loss(self) -> Optional[float]:
+        if self._holdout_dataset is None or len(self._holdout_dataset) == 0:
+            return None
+        if self.holdout_eval_interval <= 0:
+            return None
+        if self.version % self.holdout_eval_interval != 0:
+            return None
+
+        sampled = self._holdout_dataset.sample_batch(self.holdout_batch_size)
+        items = sampled["items"]
+        target_actions = sampled["actions"].to(
+            device=Worker.torch_platform.current_device(), dtype=torch.float32
+        )
+        env_obs = self._build_holdout_env_obs(items)
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if not hasattr(model, "predict_action_batch"):
+            return None
+
+        train_mode = model.training
+        model.eval()
+        try:
+            pred_actions, _ = model.predict_action_batch(
+                env_obs=env_obs,
+                do_sample=False,
+                temperature=1.0,
+                top_k=-1,
+                top_p=1.0,
+                max_new_tokens=None,
+            )
+            pred_actions = torch.as_tensor(
+                pred_actions, device=target_actions.device, dtype=torch.float32
+            )
+            # [B, num_action_chunks, action_dim] -> first action chunk alignment
+            if pred_actions.ndim == 3:
+                pred_actions = pred_actions[:, 0, :]
+            action_dim = min(pred_actions.shape[-1], target_actions.shape[-1])
+            holdout_l1 = torch.abs(
+                pred_actions[:, :action_dim] - target_actions[:, :action_dim]
+            ).mean()
+            return float(holdout_l1.item())
+        finally:
+            if train_mode:
+                model.train()
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1204,6 +1545,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        prev_logprobs = self.rollout_batch.get("prev_logprobs", None)
+        if prev_logprobs is not None:
+            rollout_metrics.update(
+                {
+                    "prev_logprobs_mean": float(prev_logprobs.float().mean().item()),
+                    "prev_logprobs_std": float(prev_logprobs.float().std().item()),
+                }
+            )
         return rollout_metrics
 
     def _build_sft_data_loader(self):
@@ -1334,6 +1683,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
+        behavior_drift_kl = self._compute_behavior_drift_kl(
+            batch_size_per_rank=batch_size_per_rank
+        )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
@@ -1411,6 +1763,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         == SupportedModel.GR00T
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
+                    logprob_delta = prev_logprobs - output_dict["logprobs"]
+                    if loss_mask is not None:
+                        valid_mask = loss_mask
+                        while len(valid_mask.shape) < len(logprob_delta.shape):
+                            valid_mask = valid_mask.unsqueeze(-1)
+                        valid_mask = valid_mask.expand_as(logprob_delta).to(dtype=torch.bool)
+                        if valid_mask.any():
+                            approx_kl = logprob_delta[valid_mask].float().mean()
+                        else:
+                            approx_kl = logprob_delta.float().mean()
+                    else:
+                        approx_kl = logprob_delta.float().mean()
 
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
@@ -1453,6 +1817,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+                    metrics_data["actor/approx_kl"] = approx_kl.detach().item()
 
                     if self.enable_sft_co_train:
                         self._train_sft_epoch(metrics_data, loss)
@@ -1479,6 +1844,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.optimizer.zero_grad()
         clear_memory()
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        if behavior_drift_kl is not None:
+            mean_metric_dict["actor/behavior_drift_kl"] = behavior_drift_kl
+        holdout_l1 = self._compute_holdout_action_support_loss()
+        if holdout_l1 is not None:
+            mean_metric_dict["actor/holdout_l1"] = holdout_l1
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )

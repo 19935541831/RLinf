@@ -23,6 +23,7 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.algorithms.transfer_utility import TransferUtilityMonitor
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
@@ -85,6 +86,10 @@ class EmbodiedRunner:
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
+        transfer_utility_cfg = self.cfg.get("transfer_utility", None)
+        self.transfer_utility_monitor = None
+        if transfer_utility_cfg is not None and transfer_utility_cfg.get("enabled", False):
+            self.transfer_utility_monitor = TransferUtilityMonitor(transfer_utility_cfg)
 
         # Async logging setup
         self.stop_logging = False
@@ -251,6 +256,7 @@ class EmbodiedRunner:
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+        should_early_stop = False
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
@@ -357,11 +363,41 @@ class EmbodiedRunner:
                     actor_training_metrics
                 ).items()
             }
+            transfer_risk_metrics = {}
+            if self.transfer_utility_monitor is not None:
+                success_rate = float(env_metrics.get("env/success_once", 0.0))
+                transfer_risk_metrics.update(
+                    self.transfer_utility_monitor.update_success_rate(
+                        success_rate=success_rate,
+                        step=self.global_step,
+                    )
+                )
+                d_beh = training_metrics.get("train/actor/behavior_drift_kl", None)
+                if d_beh is None:
+                    d_beh = training_metrics.get("train/actor/approx_kl", None)
+                if d_beh is not None:
+                    transfer_risk_metrics.update(
+                        self.transfer_utility_monitor.update_behavior_drift(
+                            kl_value=float(d_beh)
+                        )
+                    )
+                holdout_l1 = training_metrics.get("train/actor/holdout_l1", None)
+                if holdout_l1 is not None:
+                    transfer_risk_metrics.update(
+                        self.transfer_utility_monitor.update_holdout_loss(
+                            holdout_loss=float(holdout_l1)
+                        )
+                    )
+                transfer_risk_metrics.update(
+                    self.transfer_utility_monitor.compute_transfer_utility()
+                )
 
             self.metric_logger.log(env_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
             self.metric_logger.log(training_metrics, _step)
+            if transfer_risk_metrics and self.transfer_utility_monitor.should_log(_step):
+                self.metric_logger.log(transfer_risk_metrics, _step)
             self._log_ranked_metrics(
                 metrics_list=actor_rollout_metrics,
                 step=_step,
@@ -404,9 +440,28 @@ class EmbodiedRunner:
             logging_metrics.update(env_metrics)
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(training_metrics)
+            logging_metrics.update(transfer_risk_metrics)
 
             self.print_metrics_table_async(
                 _step, self.max_steps, start_time, logging_metrics, start_step
+            )
+            if (
+                self.transfer_utility_monitor is not None
+                and self.transfer_utility_monitor.auto_stop
+                and self.transfer_utility_monitor.should_stop
+            ):
+                self.logger.warning(
+                    "Transfer utility reached stop condition: "
+                    f"U_t={self.transfer_utility_monitor.transfer_utility:.6f} <= "
+                    f"xi={self.transfer_utility_monitor.xi:.6f}. "
+                    "Stopping training early."
+                )
+                should_early_stop = True
+                break
+
+        if should_early_stop:
+            self.logger.info(
+                f"Training stopped at global_step={self.global_step} due to transfer-risk rule."
             )
 
         self.metric_logger.finish()
